@@ -20,26 +20,34 @@ function main() {
   const HEARTBEAT_MS = 4000; // only used to detect track changes & play/pause
 
   const session = {
-    ws:           null,
-    amHost:       false,
-    active:       false,
-    inSession:    false, // host clicked "Go to session"
-    code:         "",
-    myName:       "",
-    sid:          "",
-    members:      [],
-    myLatency:    null,
-    pingMap:      {},
-    pingTimer:    null,
-    heartbeatTimer: null,
-    lastHostState: null,
+    ws:              null,
+    amHost:          false,
+    active:          false,
+    inSession:       false,
+    code:            "",
+    myName:          "",
+    sid:             "",
+    members:         [],
+    myLatency:       null,
+    pingMap:         {},
+    pingTimer:       null,
+    heartbeatTimer:  null,
+    lastHostState:   null,
+    reconnectTimer:  null,
+    reconnectCount:  0,    // how many times we've tried to reconnect
+    intentionalClose: false, // true when user clicks Leave — no reconnect
   };
 
   let uiCallback = null;
   function notifyUI() { uiCallback?.(); }
 
-  const log = (...a) => console.log("[LT]", ...a);
-  const err = (...a) => console.error("[LT]", ...a);
+  const log = (...a) => console.log("[CL]", ...a);
+  const err = (...a) => console.error("[CL]", ...a);
+  const dbg = (...a) => console.debug("[CL:DBG]", ...a);
+  function wsState(ws) {
+    if (!ws) return "null";
+    return ["CONNECTING","OPEN","CLOSING","CLOSED"][ws.readyState] || ws.readyState;
+  }
 
   function getSpotifyUsername() {
     try {
@@ -171,19 +179,18 @@ function main() {
       if (!s) return;
 
       const prev = session.lastHostState;
+      // Update AFTER saving prev so comparisons are correct
       session.lastHostState = s;
 
       // 1. First state received after joining → sync immediately
       if (!prev) {
         log("Initial sync on join — host isPlaying:", s.isPlaying);
         syncToState(s, "join").then(() => {
-          // After sync, apply pause if host is paused
           if (!s.isPlaying) {
             setTimeout(() => {
               if (Spicetify.Player.isPlaying) Spicetify.Player.pause();
             }, 1200);
           }
-          // Sync queue in background — give music 3s to settle first
           if (s.queue?.length) {
             setTimeout(() => syncQueueBackground(s.queue), 3000);
           }
@@ -198,12 +205,12 @@ function main() {
         return;
       }
 
-      // 3. Play/pause sync — follow host exactly
+      // 3. Play/pause sync — compare prev (before update) with new state
       if (prev.isPlaying !== s.isPlaying) {
-        log("Play/pause change — host:", s.isPlaying, "guest:", Spicetify.Player.isPlaying);
+        log("Play/pause — host:", s.isPlaying ? "playing" : "paused");
         try {
-          if (s.isPlaying  && !Spicetify.Player.isPlaying) Spicetify.Player.play();
-          if (!s.isPlaying &&  Spicetify.Player.isPlaying) Spicetify.Player.pause();
+          if (s.isPlaying  && !Spicetify.Player.isPlaying) { Spicetify.Player.play();  }
+          if (!s.isPlaying &&  Spicetify.Player.isPlaying) { Spicetify.Player.pause(); }
         } catch(e) { err("play/pause:", e); }
         return;
       }
@@ -288,11 +295,17 @@ function main() {
 
   // ─── Player event listeners (host only — fires immediately on change) ──────
   Spicetify.Player.addEventListener("onplaypause", () => {
+    dbg("onplaypause fired — active:", session.active, "amHost:", session.amHost, "wsState:", wsState(session.ws));
     if (!session.active || !session.amHost) return;
     const s = getState();
     if (s) {
-      log("Host play/pause → broadcasting immediately");
+      log("Host", s.isPlaying ? "▶ play" : "⏸ pause", "— broadcasting to guests");
       send({ type: "state", state: s });
+      // Send again after 500ms to confirm
+      setTimeout(() => {
+        const s2 = getState();
+        if (s2) send({ type: "state", state: s2 });
+      }, 500);
     }
   });
 
@@ -326,31 +339,36 @@ function main() {
   // ─── Connect to room ──────────────────────────────────────────────────────
   function connectToRoom(code, username, asHost, onProgress) {
     const url = `${SERVER_URL}/room/${code}?name=${encodeURIComponent(username)}`;
-    log("Connecting to:", url);
+    log(`Connecting [attempt ${session.reconnectCount + 1}] → ${url}`);
 
     const ws = new WebSocket(url);
     session.ws = ws;
 
     const timeout = setTimeout(() => {
-      if (!session.active) { onProgress({ type: "timeout" }); cleanup(); }
+      if (!session.active) {
+        err("Connection timeout after 15s");
+        onProgress({ type: "timeout" });
+        cleanup();
+      }
     }, 15000);
 
     ws.onopen = () => {
       clearTimeout(timeout);
-      log("WS open");
-      session.active        = true;
-      session.amHost        = asHost;
-      session.code          = code;
-      session.myName        = username;
-      session.sid           = Math.random().toString(36).slice(2); // unique per session
-      session.lastHostState = null;
+      log("WS open ✓ — state:", wsState(ws));
+      session.active           = true;
+      session.amHost           = asHost;
+      session.code             = code;
+      session.myName           = username;
+      session.sid              = Math.random().toString(36).slice(2);
+      session.reconnectCount   = 0; // reset on successful connect
+      session.intentionalClose = false;
       if (!session.members.find(m => m.name === username)) {
         session.members.push({ name: username });
       }
       if (asHost) {
         startHeartbeat();
       } else {
-        session.inSession = true; // guests go straight to session
+        session.inSession = true;
         startGuestPing();
       }
       onProgress({ type: "connected" });
@@ -358,28 +376,70 @@ function main() {
     };
 
     ws.onmessage = (ev) => {
-      try { onMessage(JSON.parse(ev.data)); } catch(e) { err("parse:", e); }
+      try {
+        const msg = JSON.parse(ev.data);
+        dbg("← received:", msg.type, msg._sid ? `(sid: ${msg._sid.slice(0,6)})` : "");
+        onMessage(msg);
+      } catch(e) { err("parse error:", e, "raw:", ev.data?.slice(0, 100)); }
     };
 
-    ws.onclose = () => {
+    ws.onclose = (ev) => {
+      log(`WS closed — code: ${ev.code}, reason: "${ev.reason}", clean: ${ev.wasClean}`);
+
+      // If user intentionally left, don't reconnect
+      if (session.intentionalClose) {
+        log("Intentional close — no reconnect");
+        return;
+      }
+
       if (session.active) {
-        const wasHost = session.amHost;
-        cleanup();
-        renderUI();
-        Spicetify.showNotification(wasHost ? "Session ended" : "Host left — session ended");
+        const savedCode     = session.code;
+        const savedName     = session.myName;
+        const savedAsHost   = session.amHost;
+        const savedMembers  = [...session.members];
+        const reconnectNum  = session.reconnectCount + 1;
+
+        // Don't reconnect if too many attempts
+        if (reconnectNum > 5) {
+          err("Too many reconnect attempts — giving up");
+          cleanup();
+          renderUI();
+          Spicetify.showNotification("Session lost — too many reconnect attempts");
+          return;
+        }
+
+        // Keep session visually active while reconnecting
+        session.reconnectCount = reconnectNum;
+        Spicetify.showNotification(`⚠️ Connection lost — reconnecting (${reconnectNum}/5)…`);
+        log(`Reconnecting in 2s… attempt ${reconnectNum}/5`);
+
+        session.reconnectTimer = setTimeout(() => {
+          // Restore members so UI doesn't flash empty
+          session.members = savedMembers;
+          connectToRoom(savedCode, savedName, savedAsHost, (ev) => {
+            if (ev.type === "connected") {
+              Spicetify.showNotification("✅ Reconnected!");
+              notifyUI();
+            }
+          });
+        }, 2000);
       }
     };
 
-    ws.onerror = () => {
+    ws.onerror = (ev) => {
+      err("WS error:", ev.type, "— WS state:", wsState(ws));
       clearTimeout(timeout);
-      onProgress({ type: "error", msg: "Connection failed." });
-      cleanup();
+      if (!session.active) {
+        onProgress({ type: "error", msg: "Connection failed. Check your internet." });
+      }
     };
   }
 
   // ─── Cleanup ──────────────────────────────────────────────────────────────
   function cleanup() {
+    log("Cleanup — was active:", session.active, "amHost:", session.amHost);
     stopHeartbeat();
+    if (session.reconnectTimer) { clearTimeout(session.reconnectTimer); session.reconnectTimer = null; }
     session.active        = false;
     session.myLatency     = null;
     session.pingMap       = {};
@@ -390,7 +450,11 @@ function main() {
     session.amHost        = false;
     session.inSession     = false;
     session.lastHostState = null;
-    if (session.ws) { try { session.ws.close(); } catch {} session.ws = null; }
+    session.reconnectCount = 0;
+    if (session.ws) {
+      try { session.ws.close(); } catch {}
+      session.ws = null;
+    }
     notifyUI();
   }
 
@@ -531,6 +595,8 @@ function main() {
     }
 
     function leave() {
+      log("User leaving session intentionally");
+      session.intentionalClose = true;
       send({ type: "left", user: username });
       cleanup();
       setPaste(""); setError(""); setLoading(false);
