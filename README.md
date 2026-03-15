@@ -2,7 +2,7 @@
 
 A Spicetify extension that lets you listen to music in sync with your friends in real time. Share a 6-character code, everyone joins instantly. No accounts, no setup.
 
-![Preview](preview.png)
+![Preview](Preview.png)
 
 ## Features
 
