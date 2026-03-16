@@ -808,10 +808,11 @@ function main() {
         container
       );
       // Apply drag after React renders the panel
-      requestAnimationFrame(() => {
-        const panel = container.querySelector(".lt-panel");
+      setTimeout(() => {
+        const panel = document.querySelector("#lt-root .lt-panel");
+        log("applyDrag — panel found:", !!panel);
         if (panel) applyDrag(panel);
-      });
+      }, 100);
     } else if (session.active || session.ws) {
       ReactDOM.render(
         React.createElement(Bar, { onClick: () => { isOpen = true; renderUI(); } }),
