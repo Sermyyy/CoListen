@@ -92,7 +92,7 @@ function main() {
         uri:       d.item.uri,
         name:      d.item.name || "",
         position:  Spicetify.Player.getProgress(),
-        isPlaying: Spicetify.Player.isPlaying,
+
         queue,
         sentAt:    Date.now(),
       };
@@ -205,15 +205,7 @@ function main() {
         return;
       }
 
-      // 3. Play/pause sync — compare prev (before update) with new state
-      if (prev.isPlaying !== s.isPlaying) {
-        log("Play/pause — host:", s.isPlaying ? "playing" : "paused");
-        try {
-          if (s.isPlaying  && !Spicetify.Player.isPlaying) { Spicetify.Player.play();  }
-          if (!s.isPlaying &&  Spicetify.Player.isPlaying) { Spicetify.Player.pause(); }
-        } catch(e) { err("play/pause:", e); }
-        return;
-      }
+      // Play/pause not synced — guest controls their own playback independently
 
       // 4. Nothing changed → do nothing (no seek, no interrupt)
       return;
@@ -294,20 +286,7 @@ function main() {
   }
 
   // ─── Player event listeners (host only — fires immediately on change) ──────
-  Spicetify.Player.addEventListener("onplaypause", () => {
-    dbg("onplaypause fired — active:", session.active, "amHost:", session.amHost, "wsState:", wsState(session.ws));
-    if (!session.active || !session.amHost) return;
-    const s = getState();
-    if (s) {
-      log("Host", s.isPlaying ? "▶ play" : "⏸ pause", "— broadcasting to guests");
-      send({ type: "state", state: s });
-      // Send again after 500ms to confirm
-      setTimeout(() => {
-        const s2 = getState();
-        if (s2) send({ type: "state", state: s2 });
-      }, 500);
-    }
-  });
+
 
   Spicetify.Player.addEventListener("songchange", () => {
     if (!session.active || !session.amHost) return;
