@@ -697,7 +697,7 @@ function main() {
                     ),
 
                     e("div", { style: { marginTop: "14px" } },
-                        e("div", { className: "lt-lb" }, "Add to shared queue (optional)"),
+                        e("div", { className: "lt-lb" }, "Add to shared queue"),
                         e("input", {
                             className: "lt-ni",
                             placeholder: "https://open.spotify.com/track/... or spotify:track:...",
