@@ -129,12 +129,19 @@ export class Room {
 
     const url = new URL(request.url);
     const name = url.searchParams.get("name") || "Anonymous";
+    const userId = url.searchParams.get("userId");
+    
+    for (const [id, session] of this.sessions) {
+      if (session.userId === userId) {
+        try { session.ws.close(1000, "Reconnecting"); } catch {}
+        this.sessions.delete(id);
+      }
+    }
     const [client, server] = Object.values(new WebSocketPair());
-
     server.accept();
-
+    
     const sessionId = crypto.randomUUID();
-    this.sessions.set(sessionId, { ws: server, name });
+    this.sessions.set(sessionId, { ws: server, name, userId });
 
     this.broadcast({ type: "joined", user: name }, sessionId);
     this.broadcast({
